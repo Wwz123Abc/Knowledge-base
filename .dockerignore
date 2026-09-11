@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+__pycache__
+.pytest_cache
+.ruff_cache
+.env
+data/app.db
+data/uploads
+reports
+backups
+tests
+evals
+docs
+scripts
+TASKS.md
+*.log

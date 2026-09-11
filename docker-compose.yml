@@ -1,0 +1,233 @@
+name: enterprise-rag
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rag
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  clamav:
+    image: clamav/clamav:1.5.3-debian13-slim
+    restart: unless-stopped
+    # Optional and off by default: `docker compose --profile clamav up -d` to include it.
+    # It's one of the heavier containers memory-wise, and app/security.py already treats
+    # scanning as opt-in (skipped whenever CLAMAV_HOST is unset), so low-memory deployments
+    # can drop it entirely without touching application code.
+    profiles: ["clamav"]
+    volumes:
+      - clamav_data:/var/lib/clamav
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  reranker:
+    image: michaelf34/infinity@sha256:161ef2dd48ba050ad29a413d671270502acb4ad67759d695eb0d325c033a935d
+    restart: unless-stopped
+    # Optional and off by default: `docker compose --profile reranker up -d` to include it.
+    # It's a real Cross-Encoder transformer running under torch — comfortably the heaviest
+    # container here memory-wise. When it's off, RERANKER_PROVIDER should be set to
+    # token_overlap so the app falls back to the lexical reranker instead of trying (and
+    # failing) to reach a reranker that was never started.
+    profiles: ["reranker"]
+    command:
+      - v2
+      - --engine
+      - torch
+      - --model-id
+      - BAAI/bge-reranker-v2-m3
+      - --batch-size
+      - "4"
+      - --port
+      - "7997"
+    environment:
+      DO_NOT_TRACK: "1"
+    volumes:
+      - reranker_cache:/app/.cache
+    ports:
+      - "7997:7997"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7997/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://rag:rag_password@postgres:5432/rag
+      VECTOR_BACKEND: pgvector
+      POSTGRES_VECTOR_URL: postgresql+psycopg://rag:rag_password@postgres:5432/rag
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_CACHE_DIR: /app/data/model_cache
+      HF_HUB_DISABLE_XET: "1"
+      # huggingface.co is unreachable from mainland China hosts (GFW) — fastembed's
+      # TextEmbedding still hits the Hub API to check the model revision even with a warm
+      # local cache, so every ingestion job failed with "Network is unreachable" until this
+      # was pointed at the mirror. hf-mirror.com proxies the same repos.
+      HF_ENDPOINT: ${HF_ENDPOINT:-}
+      CHAT_FALLBACK_MODELS: ${CHAT_FALLBACK_MODELS:-}
+      MODEL_PRICING_JSON: ${MODEL_PRICING_JSON:-{}}
+      AUTH_MODE: ${AUTH_MODE:-dev}
+      DEV_ROLES: ${DEV_ROLES:-admin,user}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-}
+      WECOM_CORP_ID: ${WECOM_CORP_ID:-}
+      WECOM_AGENT_ID: ${WECOM_AGENT_ID:-}
+      WECOM_SECRET: ${WECOM_SECRET:-}
+      WECOM_REDIRECT_URI: ${WECOM_REDIRECT_URI:-}
+      WECOM_TENANT_ID: ${WECOM_TENANT_ID:-default}
+      WECOM_ADMIN_USERIDS: ${WECOM_ADMIN_USERIDS:-}
+      WECOM_SUPER_ADMIN_USERIDS: ${WECOM_SUPER_ADMIN_USERIDS:-}
+      WECOM_SESSION_SECRET: ${WECOM_SESSION_SECRET:-}
+      TASK_BACKEND: celery
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CACHE_URL: redis://redis:6379/2
+      RERANKER_PROVIDER: ${RERANKER_PROVIDER:-cross_encoder_api}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      RERANKER_BASE_URL: ${RERANKER_BASE_URL:-http://reranker:7997}
+      RERANKER_API_KEY: ${RERANKER_API_KEY:-}
+      RERANKER_TIMEOUT_SECONDS: ${RERANKER_TIMEOUT_SECONDS:-60}
+      RERANKER_MAX_CHARS: ${RERANKER_MAX_CHARS:-256}
+      RERANK_K: ${RERANK_K:-18}
+      CORRECTIVE_MIN_RERANK_SCORE: ${CORRECTIVE_MIN_RERANK_SCORE:-0.05}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
+      CLAMAV_HOST: ${CLAMAV_HOST:-}
+      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+      OCR_ENABLED: ${OCR_ENABLED:-true}
+      OCR_LANGUAGE: ${OCR_LANGUAGE:-chi_sim+eng}
+      TOOL_DATABASE_URL: ${TOOL_DATABASE_URL:-}
+      TOOL_ALLOWED_TABLES: ${TOOL_ALLOWED_TABLES:-}
+      TOOL_HTTP_ALLOWED_DOMAINS: ${TOOL_HTTP_ALLOWED_DOMAINS:-}
+      TOOL_HTTP_REQUIRE_HTTPS: ${TOOL_HTTP_REQUIRE_HTTPS:-true}
+      TOOL_MAX_ROWS: ${TOOL_MAX_ROWS:-200}
+      TOOL_SQL_TIMEOUT_MS: ${TOOL_SQL_TIMEOUT_MS:-10000}
+      HEALTH_DEPENDENCY_TIMEOUT_SECONDS: ${HEALTH_DEPENDENCY_TIMEOUT_SECONDS:-2}
+      HEALTH_CHECK_MODEL: ${HEALTH_CHECK_MODEL:-false}
+    volumes:
+      - uploads_data:/app/data/uploads
+      - model_cache:/app/data/model_cache
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["sh", "-c", "alembic upgrade head && celery -A app.tasks.celery_app worker --loglevel=INFO --concurrency=2"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://rag:rag_password@postgres:5432/rag
+      VECTOR_BACKEND: pgvector
+      POSTGRES_VECTOR_URL: postgresql+psycopg://rag:rag_password@postgres:5432/rag
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_CACHE_DIR: /app/data/model_cache
+      HF_HUB_DISABLE_XET: "1"
+      # huggingface.co is unreachable from mainland China hosts (GFW) — fastembed's
+      # TextEmbedding still hits the Hub API to check the model revision even with a warm
+      # local cache, so every ingestion job failed with "Network is unreachable" until this
+      # was pointed at the mirror. hf-mirror.com proxies the same repos.
+      HF_ENDPOINT: ${HF_ENDPOINT:-}
+      CHAT_FALLBACK_MODELS: ${CHAT_FALLBACK_MODELS:-}
+      MODEL_PRICING_JSON: ${MODEL_PRICING_JSON:-{}}
+      TASK_BACKEND: celery
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CACHE_URL: redis://redis:6379/2
+      OCR_ENABLED: ${OCR_ENABLED:-true}
+      OCR_LANGUAGE: ${OCR_LANGUAGE:-chi_sim+eng}
+    volumes:
+      - uploads_data:/app/data/uploads
+      - model_cache:/app/data/model_cache
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.tasks.celery_app", "inspect", "ping", "--timeout=5"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # Optional: `docker compose --profile cloud up -d` to terminate HTTPS for a real domain
+  # (requires DOMAIN in .env and DNS already pointed at this host, plus 80/443 reachable —
+  # Caddy uses 80 for the Let's Encrypt HTTP-01 challenge). Local/dev use of localhost:8000
+  # via the api service's own port mapping is unaffected either way.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    profiles: ["cloud"]
+    depends_on:
+      - api
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  uploads_data:
+  redis_data:
+  clamav_data:
+  model_cache:
+  reranker_cache:
+  caddy_data:
+  caddy_config:

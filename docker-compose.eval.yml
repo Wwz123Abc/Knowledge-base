@@ -1,0 +1,6 @@
+# Temporary override for evaluation: publish the RAG API on :8001
+# because a host process (工艺智核检索) occupies :8000.
+services:
+  api:
+    ports:
+      - "8001:8000"
