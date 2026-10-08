@@ -47,9 +47,10 @@ def main() -> None:
                 result = service.process_job(db, job.id)
                 if result.status == "completed":
                     completed += 1
+                    db.refresh(document)
                     print(
                         f"[{index}/{len(documents)}] OK   {document.title[:40]} "
-                        f"chunks={result.document.chunk_count}",
+                        f"chunks={document.chunk_count}",
                         flush=True,
                     )
                 else:

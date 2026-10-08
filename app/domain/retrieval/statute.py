@@ -9,12 +9,16 @@ from datetime import UTC, datetime
 from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.models import DocumentAccessGroup, KnowledgeChunk, KnowledgeDocument
+from app.models import (
+    DocumentAccessGroup,
+    DocumentKnowledgeBase,
+    KnowledgeChunk,
+    KnowledgeDocument,
+)
 
 _CN_DIGITS = "零一二三四五六七八九"
 _ARTICLE_RE = re.compile(r"第([0-9]+|[一二三四五六七八九十百千]+)条")
 _COUNT_RE = re.compile(r"(一共|总共|共有|合计|多少条|几条|总条数|多少条)")
-_MAX_SCAN_CHUNKS = 800
 
 
 def cn_to_int(text: str) -> int:
@@ -119,7 +123,8 @@ def find_article_chunks(
     tenant_id: str,
     phrases: Sequence[str],
     user_groups: Sequence[str],
-    limit: int = 6,
+    knowledge_base_ids: Sequence[str] = (),
+    limit: int = 12,
 ) -> list[KnowledgeChunk]:
     """Exact-phrase lookup for 第N条 across authorized, effective documents."""
     if not phrases:
@@ -142,6 +147,32 @@ def find_article_chunks(
         )
     else:
         acl_allowed = ~acl_exists
+    filters = [
+        KnowledgeChunk.tenant_id == tenant_id,
+        KnowledgeDocument.status == "ready",
+        or_(*conditions),
+        acl_allowed,
+    ]
+    if knowledge_base_ids:
+        # Same rule as the lexical channel: documents in a selected knowledge base, plus the
+        # ones not assigned to any. The exact-match shortcut must not reach past the scope
+        # the user chose.
+        has_base = exists(
+            select(DocumentKnowledgeBase.id).where(
+                DocumentKnowledgeBase.document_id == KnowledgeDocument.id
+            )
+        )
+        filters.append(
+            or_(
+                ~has_base,
+                exists(
+                    select(DocumentKnowledgeBase.id).where(
+                        DocumentKnowledgeBase.document_id == KnowledgeDocument.id,
+                        DocumentKnowledgeBase.knowledge_base_id.in_(list(knowledge_base_ids)),
+                    )
+                ),
+            )
+        )
     rows = list(
         db.scalars(
             select(KnowledgeChunk)
@@ -150,12 +181,7 @@ def find_article_chunks(
                 selectinload(KnowledgeChunk.document).selectinload(KnowledgeDocument.acl_entries),
                 selectinload(KnowledgeChunk.document).selectinload(KnowledgeDocument.versions),
             )
-            .where(
-                KnowledgeChunk.tenant_id == tenant_id,
-                KnowledgeDocument.status == "ready",
-                or_(*conditions),
-                acl_allowed,
-            )
+            .where(*filters)
             .order_by(KnowledgeChunk.position)
             .limit(limit)
         )
@@ -164,29 +190,31 @@ def find_article_chunks(
 
 
 def find_max_article_chunk(
-    db: Session, tenant_id: str, document_ids: Sequence[str], limit_scan: int = _MAX_SCAN_CHUNKS
+    db: Session, tenant_id: str, document_ids: Sequence[str]
 ) -> KnowledgeChunk | None:
-    """Return the chunk with the numerically largest 第N条 among the given documents."""
+    """Return the chunk with the numerically largest 第N条 among the given documents.
+
+    Scans every chunk of those documents, streaming in batches: the largest article number
+    sits at the *end* of a statute, so a scan capped at the first N chunks (as this used to
+    be) undercounts exactly the long statutes this question is asked about.
+    """
     if not document_ids:
         return None
-    chunks = list(
-        db.scalars(
-            select(KnowledgeChunk)
-            .where(
-                KnowledgeChunk.tenant_id == tenant_id,
-                KnowledgeChunk.document_id.in_(list(document_ids)),
-            )
-            .order_by(KnowledgeChunk.position)
-            .limit(limit_scan)
+    rows = db.execute(
+        select(KnowledgeChunk.id, KnowledgeChunk.content)
+        .where(
+            KnowledgeChunk.tenant_id == tenant_id,
+            KnowledgeChunk.document_id.in_(list(document_ids)),
         )
+        .execution_options(yield_per=500)
     )
-    best_chunk: KnowledgeChunk | None = None
+    best_id: str | None = None
     best_number = 0
-    for chunk in chunks:
-        for match in _ARTICLE_RE.finditer(chunk.content):
+    for chunk_id, content in rows:
+        for match in _ARTICLE_RE.finditer(content):
             raw = match.group(1)
             number = int(raw) if raw.isdigit() else cn_to_int(raw)
             if number > best_number:
                 best_number = number
-                best_chunk = chunk
-    return best_chunk
+                best_id = chunk_id
+    return db.get(KnowledgeChunk, best_id) if best_id else None

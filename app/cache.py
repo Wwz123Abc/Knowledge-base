@@ -20,10 +20,17 @@ from app.core.retrieval import RetrievalResult
 _EPOCH_CACHE_TTL_SECONDS = 1.5
 
 
+def _redis_client(settings: Settings):
+    # Without timeouts a hung (not refused) Redis would block every request on a cache read.
+    if not settings.cache_url:
+        return None
+    return redis.Redis.from_url(settings.cache_url, socket_connect_timeout=0.5, socket_timeout=0.5)
+
+
 class RetrievalCache:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.client = redis.Redis.from_url(settings.cache_url) if settings.cache_url else None
+        self.client = _redis_client(settings)
         self._epoch_cache: dict[str, tuple[int, float]] = {}
 
     def key(
@@ -124,7 +131,7 @@ class QueryRewriteCache:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.client = redis.Redis.from_url(settings.cache_url) if settings.cache_url else None
+        self.client = _redis_client(settings)
 
     def key(self, question: str, history_text: str) -> str:
         raw = json.dumps({"question": question, "history": history_text}, ensure_ascii=False)

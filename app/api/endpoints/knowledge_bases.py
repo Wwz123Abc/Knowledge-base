@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 
 from app.api.dependencies import DbSession
 from app.audit import write_audit
@@ -23,15 +24,16 @@ def list_knowledge_bases(
     # knowledge bases that actually contain something their groups can read, so a
     # department-restricted knowledge base doesn't show up as a selectable scope for people
     # outside that department.
-    can_manage = SUPER_ADMIN_ROLE in auth.roles or "document.manage" in permission_codes_for(
-        db, auth.tenant_id, auth.roles
-    )
+    codes = permission_codes_for(db, auth.tenant_id, auth.roles)
+    is_super = SUPER_ADMIN_ROLE in auth.roles
+    can_manage = is_super or "document.manage" in codes
+    can_manage_bases = is_super or "knowledge_base.manage" in codes
     return KnowledgeBaseService().list(
         db,
         auth.tenant_id,
         max(offset, 0),
         min(max(limit, 1), 500),
-        include_disabled and auth.is_admin,
+        include_disabled and can_manage_bases,
         visible_to_groups=None if can_manage else list(auth.groups),
     )
 
@@ -60,7 +62,7 @@ def create_knowledge_base(payload: KnowledgeBaseCreate, db: DbSession, auth: Kno
         )
         db.commit()
         return knowledge_base
-    except Exception as exc:
+    except IntegrityError as exc:
         raise HTTPException(status_code=409, detail="知识库名称已存在") from exc
 
 
@@ -89,7 +91,7 @@ def update_knowledge_base(
         return knowledge_base
     except HTTPException:
         raise
-    except Exception as exc:
+    except IntegrityError as exc:
         raise HTTPException(status_code=409, detail="知识库名称已存在") from exc
 
 

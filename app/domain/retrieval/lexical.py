@@ -5,7 +5,7 @@ from sqlalchemy import case, exists, literal, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
-from app.domain.retrieval.tokens import escape_like, tokenize
+from app.domain.retrieval.tokens import escape_like, lexical_tokens
 from app.models import (
     DocumentAccessGroup,
     DocumentKnowledgeBase,
@@ -23,7 +23,7 @@ class LexicalSearchMixin:
         user_groups: list[str],
         knowledge_base_ids: list[str],
     ) -> list[Document]:
-        query_tokens = list(dict.fromkeys(tokenize(query)))[:24]
+        query_tokens = lexical_tokens(query)
         if not query_tokens:
             return []
         if db.bind is not None and db.bind.dialect.name == "sqlite":

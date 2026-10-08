@@ -4,9 +4,12 @@ import httpx
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from app.auth import get_auth_context
 from app.config import Settings, get_settings
+from app.db import Base
 from app.main import app
 from app.wecom import (
     WeComError,
@@ -94,9 +97,12 @@ def test_mint_session_token_round_trips_through_get_auth_context():
     credentials = httpx.Headers({"authorization": f"Bearer {token}"})
     from fastapi.security import HTTPAuthorizationCredentials
 
-    auth = get_auth_context(
-        HTTPAuthorizationCredentials(scheme="Bearer", credentials=token), settings
-    )
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        auth = get_auth_context(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=token), settings, db
+        )
     assert auth.user_id == "alice"
     assert auth.tenant_id == "acme"
     assert set(auth.groups) == {"dept_3", "dept_12"}
@@ -110,13 +116,13 @@ async def test_exchange_code_for_identity_success():
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/cgi-bin/gettoken":
-            return httpx.Response(200, json={"errcode": 0, "access_token": "tok", "expires_in": 7200})
+            return httpx.Response(
+                200, json={"errcode": 0, "access_token": "tok", "expires_in": 7200}
+            )
         if request.url.path == "/cgi-bin/user/getuserinfo":
             return httpx.Response(200, json={"errcode": 0, "UserId": "alice"})
         if request.url.path == "/cgi-bin/user/get":
-            return httpx.Response(
-                200, json={"errcode": 0, "name": "Alice", "department": [3, 12]}
-            )
+            return httpx.Response(200, json={"errcode": 0, "name": "Alice", "department": [3, 12]})
         raise AssertionError(f"unexpected path {request.url.path}")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -134,7 +140,9 @@ async def test_exchange_code_for_identity_raises_on_wecom_error():
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/cgi-bin/gettoken":
-            return httpx.Response(200, json={"errcode": 0, "access_token": "tok", "expires_in": 7200})
+            return httpx.Response(
+                200, json={"errcode": 0, "access_token": "tok", "expires_in": 7200}
+            )
         return httpx.Response(200, json={"errcode": 40029, "errmsg": "invalid code"})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -182,6 +190,7 @@ def test_wecom_callback_success_sets_token_fragment(monkeypatch):
     try:
         with TestClient(app, follow_redirects=False) as client:
             state = mint_state_token(settings)
+            client.cookies.set("wecom_login_state", state, path="/api/auth/wecom")
             response = client.get(
                 "/api/auth/wecom/callback", params={"code": "good-code", "state": state}
             )

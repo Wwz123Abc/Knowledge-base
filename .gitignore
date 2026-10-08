@@ -20,3 +20,9 @@ evals/production_failures.jsonl
 data/model_cache/
 .infinity_cache/
 docs/毕业设计材料/
+
+# 本地基准测试/论文实验产生的数据库与语料，不应进入仓库
+data/*.db
+data/*.db-*
+data/bench_corpus/
+data/thesis*

@@ -18,8 +18,16 @@ WECOM_AUTHORIZE_URL = "https://open.weixin.qq.com/connect/oauth2/authorize"
 _token_cache: dict[str, tuple[str, float]] = {}
 
 
+# access_token invalid / expired / credential errors: the cached token is dead, fetch a new one.
+_TOKEN_ERRCODES = {40001, 40014, 42001}
+
+
 class WeComError(Exception):
     """A WeCom API call returned errcode != 0, or the HTTP call itself failed."""
+
+    def __init__(self, message: str, errcode: int | None = None):
+        super().__init__(message)
+        self.errcode = errcode
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +69,10 @@ async def _get(client: httpx.AsyncClient, path: str, params: dict[str, str]) -> 
         raise WeComError(f"调用企业微信接口失败：{exc}") from exc
     payload = response.json()
     if payload.get("errcode"):
-        raise WeComError(f"企业微信接口返回错误：{payload.get('errcode')} {payload.get('errmsg')}")
+        raise WeComError(
+            f"企业微信接口返回错误：{payload.get('errcode')} {payload.get('errmsg')}",
+            errcode=payload.get("errcode"),
+        )
     return payload
 
 
@@ -89,16 +100,27 @@ async def exchange_code_for_identity(
     owns_client = client is None
     client = client or httpx.AsyncClient()
     try:
-        access_token = await fetch_access_token(settings, client)
-        userinfo = await _get(
-            client, "/user/getuserinfo", {"access_token": access_token, "code": code}
-        )
-        userid = userinfo.get("UserId")
-        if not userid:
-            raise WeComError("该用户未在企业微信通讯录中，无法确定身份")
-        detail = await _get(
-            client, "/user/get", {"access_token": access_token, "userid": userid}
-        )
+        for attempt in (1, 2):
+            access_token = await fetch_access_token(settings, client)
+            try:
+                userinfo = await _get(
+                    client, "/user/getuserinfo", {"access_token": access_token, "code": code}
+                )
+                userid = userinfo.get("UserId")
+                if not userid:
+                    raise WeComError("该用户未在企业微信通讯录中，无法确定身份")
+                detail = await _get(
+                    client, "/user/get", {"access_token": access_token, "userid": userid}
+                )
+                break
+            except WeComError as exc:
+                # A token WeCom has invalidated early (secret rotated, token refreshed
+                # elsewhere) would otherwise stay cached until its local expiry and fail
+                # every login for up to two hours. Drop it and retry once with a fresh one.
+                if exc.errcode in _TOKEN_ERRCODES and attempt == 1:
+                    _token_cache.pop(settings.wecom_corp_id, None)
+                    continue
+                raise
         return WeComIdentity(
             userid=userid,
             display_name=detail.get("name") or userid,

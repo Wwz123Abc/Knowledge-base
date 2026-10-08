@@ -1,3 +1,4 @@
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from celery import Celery
@@ -19,6 +20,10 @@ celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
+    # Redis redelivers a task that hasn't been acknowledged within this window; with
+    # task_acks_late a long OCR/embedding job (or connector sync) would otherwise start a
+    # second time while the first is still running.
+    broker_transport_options={"visibility_timeout": 6 * 3600},
 )
 
 executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag-ingestion")
@@ -30,15 +35,24 @@ def run_ingestion_job(job_id: str) -> str:
     with SessionLocal() as db:
         job = get_document_service().process_job(db, job_id)
         INGESTION_JOBS.labels(job.status).inc()
-        return job.status
+        status, attempts = job.status, job.attempts
+    if status == "queued":
+        # process_job puts a job back in the queue after a transient (network) failure.
+        _schedule_retry(job_id, attempts)
+    return status
 
 
-@celery_app.task(
-    name="app.tasks.process_ingestion",
-    autoretry_for=(ConnectionError, TimeoutError),
-    retry_backoff=True,
-    max_retries=3,
-)
+def _schedule_retry(job_id: str, attempts: int) -> None:
+    delay = 20 * max(attempts, 1)
+    if settings.task_backend == "celery":
+        process_ingestion.apply_async(args=[job_id], countdown=delay)
+    else:
+        timer = threading.Timer(delay, lambda: executor.submit(run_ingestion_job, job_id))
+        timer.daemon = True
+        timer.start()
+
+
+@celery_app.task(name="app.tasks.process_ingestion")
 def process_ingestion(job_id: str) -> str:
     return run_ingestion_job(job_id)
 

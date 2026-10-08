@@ -9,6 +9,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient
 
+from app.api.dependencies import DbSession
 from app.config import Settings, get_settings
 
 bearer = HTTPBearer(auto_error=False)
@@ -21,10 +22,6 @@ class AuthContext:
     tenant_id: str
     groups: tuple[str, ...]
     roles: tuple[str, ...]
-
-    @property
-    def is_admin(self) -> bool:
-        return "admin" in self.roles
 
 
 @lru_cache(maxsize=8)
@@ -44,6 +41,7 @@ def _claim_list(claims: dict[str, Any], name: str) -> tuple[str, ...]:
 def get_auth_context(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     settings: Annotated[Settings, Depends(get_settings)],
+    db: DbSession,
 ) -> AuthContext:
     if settings.auth_mode == "dev":
         return AuthContext(
@@ -81,12 +79,22 @@ def get_auth_context(
                 detail="登录会话无效或已过期，请重新登录",
                 headers={"WWW-Authenticate": "Bearer"},
             ) from exc
+        user_id = str(claims["sub"])
+        tenant_id = str(claims.get("tenant_id") or "").strip() or settings.wecom_tenant_id
+        # Roles granted through the admin UI are read from the database on every request, not
+        # baked into the token at login: removing someone's role (or the person leaving)
+        # takes effect immediately instead of when their 8-hour session happens to expire.
+        from app.rbac import role_names_assigned_to
+
+        granted = [
+            name for name in role_names_assigned_to(db, tenant_id, user_id) if name != "super_admin"
+        ]
         return AuthContext(
-            user_id=str(claims["sub"]),
+            user_id=user_id,
             display_name=str(claims.get("name") or claims["sub"]),
-            tenant_id=str(claims.get("tenant_id") or "").strip() or settings.wecom_tenant_id,
+            tenant_id=tenant_id,
             groups=_claim_list(claims, "groups"),
-            roles=_claim_list(claims, "roles"),
+            roles=tuple(dict.fromkeys([*_claim_list(claims, "roles"), *granted])),
         )
 
     if not settings.oidc_jwks_url or not settings.oidc_issuer or not settings.oidc_audience:

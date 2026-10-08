@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
 from app.api.dependencies import DbSession
@@ -15,7 +15,10 @@ router = APIRouter()
 
 @router.post("/admin/vector-index/reconcile", response_model=VectorReconcileOut)
 def reconcile_vector_index(db: DbSession, auth: SystemAdmin):
-    reconciliation_summary = get_document_service().reconcile_vector_index(db)
+    try:
+        reconciliation_summary = get_document_service().reconcile_vector_index(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     write_audit(
         db,
         auth,

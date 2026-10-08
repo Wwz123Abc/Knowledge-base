@@ -44,7 +44,11 @@ def start_connector_sync(connector_id: str, db: DbSession, auth: ConnectorManage
         raise HTTPException(status_code=404, detail="连接器不存在或已停用")
     write_audit(db, auth, "connector.sync", "knowledge_connector", connector_id)
     db.commit()
-    enqueue_connector_sync(run.id)
+    try:
+        enqueue_connector_sync(run.id)
+    except Exception as exc:
+        ConnectorService().fail_run(db, run.id, "任务队列暂不可用，尚未开始同步")
+        raise HTTPException(status_code=503, detail="任务队列暂不可用，请稍后重试") from exc
     return run
 
 

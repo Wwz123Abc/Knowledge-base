@@ -37,6 +37,8 @@ _usage_record = chat_helpers.usage_record
 
 logger = logging.getLogger("rag.service")
 
+_CANCEL_POLL_SECONDS = 0.25
+
 
 class RagService:
     def __init__(self, settings: Settings, vector_store):
@@ -65,18 +67,13 @@ class RagService:
         if not documents:
             return self._fallback_or_insufficient(db, request, auth, trace, started)
 
-        context = _format_context(documents)
-        history = _format_history(request.conversation_history)
-        prompt = f"""最近对话：
-{history or "无"}
-
-知识库资料：
-{context}
-
-用户问题：{request.question}
-
-请给出有依据的回答，并用 [序号] 引用资料。"""
-        model = self._model(request.question)
+        prompt = self._prompt(request, documents)
+        # Release the pooled connection before the (slow) model call; the session reopens a
+        # transaction by itself when the answer is written back below.
+        db.commit()
+        # Route on the whole prompt: the retrieved documents and the history can carry PII
+        # even when the question itself doesn't.
+        model = self._model(prompt)
         response = get_model_circuit_breaker().call(
             model.invoke,
             [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)],
@@ -151,8 +148,13 @@ class RagService:
         documents = retrieval.documents
         trace = self._create_trace(db, request, auth, rewritten_query, retrieval.scores, documents)
         citations = [_citation(doc).model_dump() for doc in documents]
+        # Read the id *before* committing: after the commit the instance is expired, and
+        # touching any attribute (even the id) issues a SELECT that reopens a transaction —
+        # which would keep one pooled connection checked out for the whole LLM stream and cap
+        # concurrent answers at the pool size. The commit is what releases the connection.
+        trace_id = trace.id
         db.commit()
-        yield {"event": "metadata", "trace_id": trace.id, "citations": citations}
+        yield {"event": "metadata", "trace_id": trace_id, "citations": citations}
         if not documents:
             fallback_response = self._fallback_or_insufficient(db, request, auth, trace, started)
             yield {"event": "token", "content": fallback_response.answer}
@@ -176,25 +178,38 @@ class RagService:
         # partial answer persisted and an audit entry instead of leaving the trace
         # stuck holding only metadata forever.
         stream_completed = False
+        last_cancel_check = 0.0
         try:
-            for chunk in self._model(request.question).stream(
-                [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-            ):
-                streamed_usage, streamed_model = _stream_usage(chunk, streamed_usage, streamed_model)
-                if cancellations.is_cancelled(trace.id):
-                    stream_completed = True
-                    trace.answer = "".join(answer_parts)
-                    trace.latency_ms = int((time.perf_counter() - started) * 1000)
-                    trace.token_usage = _usage_record(self.settings, streamed_model, streamed_usage)
-                    write_audit(db, auth, "chat.cancel", "retrieval_trace", trace.id)
-                    db.commit()
-                    cancellations.clear(trace.id)
-                    yield {"event": "done", "cancelled": True}
-                    return
-                content = chunk.content if isinstance(chunk.content, str) else ""
-                if content:
-                    answer_parts.append(content)
-                    yield {"event": "token", "content": content}
+            # The streaming call goes through the same circuit breaker as the blocking ones,
+            # so a model outage that only shows up on streamed answers still trips it.
+            with get_model_circuit_breaker().guard():
+                for chunk in self._model(prompt).stream(
+                    [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+                ):
+                    streamed_usage, streamed_model = _stream_usage(
+                        chunk, streamed_usage, streamed_model
+                    )
+                    # Polling Redis for every single token added a round trip per token;
+                    # a stop request only needs to be noticed within a fraction of a second.
+                    now = time.monotonic()
+                    if now - last_cancel_check >= _CANCEL_POLL_SECONDS:
+                        last_cancel_check = now
+                        if cancellations.is_cancelled(trace_id):
+                            stream_completed = True
+                            trace.answer = "".join(answer_parts)
+                            trace.latency_ms = int((time.perf_counter() - started) * 1000)
+                            trace.token_usage = _usage_record(
+                                self.settings, streamed_model, streamed_usage
+                            )
+                            write_audit(db, auth, "chat.cancel", "retrieval_trace", trace.id)
+                            db.commit()
+                            cancellations.clear(trace_id)
+                            yield {"event": "done", "cancelled": True}
+                            return
+                    content = chunk.content if isinstance(chunk.content, str) else ""
+                    if content:
+                        answer_parts.append(content)
+                        yield {"event": "token", "content": content}
             stream_completed = True
         finally:
             if not stream_completed:
@@ -203,7 +218,7 @@ class RagService:
                 trace.token_usage = _usage_record(self.settings, streamed_model, streamed_usage)
                 write_audit(db, auth, "chat.interrupted", "retrieval_trace", trace.id)
                 db.commit()
-                cancellations.clear(trace.id)
+                cancellations.clear(trace_id)
         trace.answer = "".join(answer_parts)
         insufficient_context = _is_insufficient_answer(trace.answer)
         _validated_answer, invalid_citations = chat_helpers.validate_citation_indices(
@@ -213,8 +228,11 @@ class RagService:
             fallback_response = self._fallback_or_insufficient(
                 db, request, auth, trace, started, previous_answer=trace.answer
             )
-            cancellations.clear(trace.id)
+            cancellations.clear(trace_id)
             if fallback_response.fallback:
+                # The refusal text was already streamed token by token; tell the client to
+                # drop it so the user doesn't see it glued in front of the fallback answer.
+                yield {"event": "reset"}
                 yield {"event": "token", "content": fallback_response.answer}
                 yield {"event": "done", "insufficient_context": True, "fallback": True}
             else:
@@ -225,7 +243,7 @@ class RagService:
         trace.token_usage = _usage_record(self.settings, streamed_model, streamed_usage)
         write_audit(db, auth, "chat.stream", "retrieval_trace", trace.id)
         db.commit()
-        cancellations.clear(trace.id)
+        cancellations.clear(trace_id)
         yield {
             "event": "done",
             "insufficient_context": insufficient_context,
@@ -322,7 +340,14 @@ class RagService:
                 "chat.fallback",
                 "retrieval_trace",
                 trace.id,
-                {"question": request.question, "fallback": True},
+                {
+                    "question": (
+                        redact_pii(request.question)
+                        if self.settings.redact_audit_pii
+                        else request.question
+                    ),
+                    "fallback": True,
+                },
             )
             db.commit()
             return AskResponse(

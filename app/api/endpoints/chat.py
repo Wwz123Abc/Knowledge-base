@@ -1,4 +1,5 @@
 import json
+import logging
 
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -13,12 +14,18 @@ from app.schemas import AskRequest, AskResponse, FeedbackIn, FeedbackOut
 from app.services import get_rag_service
 
 router = APIRouter()
+logger = logging.getLogger("rag.chat")
 
 
 @router.post("/chat", response_model=AskResponse)
 def ask(request: AskRequest, db: DbSession, auth: CurrentUser):
+    service = get_rag_service()
     try:
-        return get_rag_service().ask(db, request, auth)
+        # Same order as /chat/stream: reject a bad request (400) before reporting that the
+        # model isn't configured (503), so the two endpoints answer a bad knowledge_base_ids
+        # identically and the 400 doesn't depend on whether an API key happens to be set.
+        service.validate_request(db, request, auth)
+        return service.ask(db, request, auth)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -39,7 +46,16 @@ def ask_stream(request: AskRequest, db: DbSession, auth: CurrentUser):
                 event_name = str(event.get("event", "message"))
                 yield f"event: {event_name}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as exc:
-            payload = json.dumps({"event": "error", "detail": str(exc)}, ensure_ascii=False)
+            logger.exception("streaming answer failed")
+            # Only messages this application wrote itself (ValueError/RuntimeError, e.g. the
+            # circuit breaker's) are safe to show; provider and database errors can carry
+            # hostnames, key prefixes and SQL.
+            detail = (
+                str(exc)
+                if isinstance(exc, (ValueError, RuntimeError))
+                else "回答生成失败，请稍后重试"
+            )
+            payload = json.dumps({"event": "error", "detail": detail}, ensure_ascii=False)
             yield f"event: error\ndata: {payload}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

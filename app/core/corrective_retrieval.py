@@ -11,6 +11,8 @@ class CorrectiveState(TypedDict, total=False):
     result: Any
     attempts: int
     sufficient: bool
+    best_result: Any
+    best_score: float
 
 
 def build_corrective_retrieval_graph(
@@ -26,27 +28,39 @@ def build_corrective_retrieval_graph(
         }
 
     def grade_node(state: CorrectiveState) -> CorrectiveState:
-        documents = getattr(state.get("result"), "documents", [])
+        result = state.get("result")
+        documents = getattr(result, "documents", [])
         top_score = max(
             (float(doc.metadata.get("rerank_score", 0.0)) for doc in documents),
             default=0.0,
         )
-        return {"sufficient": bool(documents) and top_score >= min_rerank_score}
+        update: CorrectiveState = {"sufficient": bool(documents) and top_score >= min_rerank_score}
+        # Remember the best attempt: a rewrite can drift and come back worse (or empty), and
+        # the answer must be built from the strongest retrieval seen, not merely the last.
+        if "best_result" not in state or top_score > state.get("best_score", 0.0):
+            update["best_result"] = result
+            update["best_score"] = top_score
+        return update
 
     def route(state: CorrectiveState) -> str:
         if state.get("sufficient") or state.get("attempts", 0) >= max_attempts:
-            return END
+            return "finish"
         return "rewrite"
 
     def rewrite_node(state: CorrectiveState) -> CorrectiveState:
         return {"query": rewrite(state["query"])}
 
+    def finish_node(state: CorrectiveState) -> CorrectiveState:
+        return {"result": state["best_result"]}
+
     graph = StateGraph(CorrectiveState)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("grade", grade_node)
     graph.add_node("rewrite", rewrite_node)
+    graph.add_node("finish", finish_node)
     graph.add_edge(START, "retrieve")
     graph.add_edge("retrieve", "grade")
-    graph.add_conditional_edges("grade", route, {"rewrite": "rewrite", END: END})
+    graph.add_conditional_edges("grade", route, {"rewrite": "rewrite", "finish": "finish"})
     graph.add_edge("rewrite", "retrieve")
+    graph.add_edge("finish", END)
     return graph.compile()

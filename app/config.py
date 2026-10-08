@@ -2,7 +2,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     app_name: str = "企业知识库问答"
     api_prefix: str = "/api"
     database_url: str = "sqlite:///./data/app.db"
+    # Every in-flight request holds one pooled connection while it queries; SQLAlchemy's
+    # default (5 + 10 overflow) capped the whole service at 15 concurrent requests.
+    db_pool_size: int = Field(default=20, ge=1, le=200)
+    db_max_overflow: int = Field(default=20, ge=0, le=200)
+    db_pool_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     vector_backend: str = "memory"
     postgres_vector_url: str = "postgresql+psycopg://rag:rag_password@localhost:5432/rag"
     vector_collection: str = "enterprise_knowledge"
@@ -32,7 +37,6 @@ class Settings(BaseSettings):
     embedding_base_url: str = ""
     embedding_cache_dir: Path = Field(default=Path("./data/model_cache"))
 
-    default_tenant_id: str = "default"
     chunk_size: int = 700
     chunk_overlap: int = 100
     retrieval_k: int = 6
@@ -66,6 +70,9 @@ class Settings(BaseSettings):
     wecom_admin_userids: str = ""
     wecom_super_admin_userids: str = ""
     wecom_session_secret: str = ""
+    # Require the callback's `state` to match the cookie set when login started. Turn off
+    # only as an emergency switch if some embedded browser is found to drop cookies.
+    wecom_require_state_cookie: bool = True
     wecom_session_ttl_minutes: int = Field(default=480, gt=0, le=10_080)
 
     task_backend: str = "inprocess"
@@ -73,7 +80,6 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://localhost:6379/1"
 
     enable_query_rewrite: bool = True
-    lexical_candidate_limit: int = 2000
     hybrid_vector_weight: float = 0.65
     hybrid_lexical_weight: float = 0.35
     rerank_k: int = 18
@@ -86,6 +92,9 @@ class Settings(BaseSettings):
     max_archive_uncompressed_mb: int = 200
     redact_audit_pii: bool = True
     rate_limit_per_minute: int = 120
+    # /api/metrics is closed in production unless a token is set; Prometheus then scrapes
+    # it with `Authorization: Bearer <token>`.
+    metrics_token: str = ""
     trusted_proxy_ips: str = ""
     allowed_origins: str = ""
     reranker_provider: str = "token_overlap"
@@ -104,6 +113,9 @@ class Settings(BaseSettings):
     ocr_enabled: bool = False
     ocr_language: str = "chi_sim+eng"
     connector_allowed_roots: str = "./connector_data"
+    # A sync that would delete more than this share of what it previously synced is
+    # treated as a missing/unmounted source, not as real deletions, and skips the deletes.
+    connector_max_delete_ratio: float = Field(default=0.5, ge=0, le=1)
     tool_database_url: str = ""
     tool_allowed_tables: str = ""
     tool_http_allowed_domains: str = ""
@@ -160,6 +172,18 @@ class Settings(BaseSettings):
         except json.JSONDecodeError:
             return {}
 
+    @model_validator(mode="after")
+    def refuse_dev_auth_in_production(self) -> "Settings":
+        # AUTH_MODE=dev hands every anonymous caller the DEV_ROLES identity (admin by
+        # default). Forgetting to set AUTH_MODE on a production host must fail loudly at
+        # startup instead of silently serving the whole system without a login.
+        if self.app_env.strip().lower() == "production" and self.auth_mode == "dev":
+            raise ValueError(
+                "APP_ENV=production 时不允许 AUTH_MODE=dev（等于所有人匿名管理员），"
+                "请改用 AUTH_MODE=wecom 或 oidc"
+            )
+        return self
+
     @field_validator("vector_backend")
     @classmethod
     def validate_vector_backend(cls, value: str) -> str:
@@ -214,9 +238,7 @@ class Settings(BaseSettings):
 
     @property
     def wecom_super_admin_userid_list(self) -> list[str]:
-        return [
-            item.strip() for item in self.wecom_super_admin_userids.split(",") if item.strip()
-        ]
+        return [item.strip() for item in self.wecom_super_admin_userids.split(",") if item.strip()]
 
     @property
     def model_ready(self) -> bool:

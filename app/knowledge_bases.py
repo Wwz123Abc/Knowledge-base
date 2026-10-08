@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 from app.core.retrieval import tokenize
 from app.models import DocumentAccessGroup, DocumentKnowledgeBase, KnowledgeBase, KnowledgeDocument
 
+_MIN_ROUTING_SCORE = 2
+
 
 class KnowledgeBaseService:
     def create(
@@ -139,18 +141,24 @@ class KnowledgeBaseService:
         return list(dict.fromkeys(ids))
 
     def route(self, db: Session, tenant_id: str, query: str) -> list[str]:
+        """Pick the knowledge bases a question most likely belongs to.
+
+        Narrowing is only worth the recall it costs when the match is strong, so it needs
+        at least two shared terms. Single Chinese characters never count: they are in
+        almost every text, and a one-character overlap used to send the question to
+        whichever knowledge base happened to share "的" or "工" while silently excluding the
+        one that actually held the answer.
+        """
         bases = self.list(db, tenant_id, limit=1000)
         if not bases:
             return []
-        query_tokens = set(tokenize(query))
+        query_terms = {term for term in tokenize(query) if len(term) > 1}
         ranked = []
         for base in bases:
             routing_text = " ".join([base.name, base.description or "", *base.routing_keywords])
-            score = len(query_tokens & set(tokenize(routing_text)))
+            score = len(query_terms & {term for term in tokenize(routing_text) if len(term) > 1})
             ranked.append((base.id, score))
-        matched = [
-            base_id
-            for base_id, score in sorted(ranked, key=lambda item: item[1], reverse=True)
-            if score > 0
-        ]
-        return matched[:3] if matched else [base.id for base in bases]
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        if ranked[0][1] < _MIN_ROUTING_SCORE:
+            return [base.id for base in bases]
+        return [base_id for base_id, score in ranked if score >= _MIN_ROUTING_SCORE][:3]

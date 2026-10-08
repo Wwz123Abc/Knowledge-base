@@ -107,7 +107,13 @@ def test_update_document_with_overlapping_access_groups_does_not_crash(tmp_path)
         )
 
         assert set(updated.access_groups) == {"hr", "finance"}
-        assert reindex_job is not None  # scope actually changed, so a reindex is expected
+        # Access changes are applied to the stored vectors in place: no re-embedding job, no
+        # downtime — the document stays searchable and its vectors carry the new groups.
+        assert reindex_job is None
+        assert updated.status == "ready"
+        last_ids, last_payload = store.metadata_updates[-1]
+        assert set(last_payload["acl_scopes"]) == {"hr", "finance"}
+        assert last_ids == [vector_id for vector_id in store.ids]
 
         # Same overlap scenario again, this time shrinking back to just "hr" — the delete
         # side of the same diff logic.

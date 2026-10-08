@@ -25,9 +25,7 @@ def test_corrective_graph_rewrites_and_retries_low_quality_retrieval():
 
 
 def test_corrective_graph_skips_rewrite_when_first_retrieval_is_already_sufficient():
-    document = Document(
-        page_content="年假为五天", metadata={"chunk_id": "c1", "rerank_score": 0.9}
-    )
+    document = Document(page_content="年假为五天", metadata={"chunk_id": "c1", "rerank_score": 0.9})
     queries = []
 
     def retrieve(query):

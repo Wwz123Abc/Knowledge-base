@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from functools import lru_cache
 from threading import Lock
 
@@ -26,6 +27,18 @@ class CircuitBreaker:
             raise
         self.record_success()
         return result
+
+    @contextmanager
+    def guard(self):
+        """For calls that can't be wrapped in `call()`, e.g. a generator being iterated."""
+        self._check()
+        try:
+            yield
+        except Exception:
+            self.record_failure()
+            raise
+        else:
+            self.record_success()
 
     def _check(self) -> None:
         with self.lock:

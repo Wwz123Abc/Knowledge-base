@@ -12,6 +12,9 @@ router = APIRouter()
 @router.get("/health", response_model=HealthResponse)
 def health(db: DbSession, settings: SettingsDep):
     dependencies = probe_dependencies(db, settings)
+    if settings.app_env.strip().lower() == "production":
+        # Error details name hosts and exception text; this endpoint needs no login.
+        dependencies["details"] = {}
     return HealthResponse(
         **dependencies,
         vector_backend=settings.vector_backend,

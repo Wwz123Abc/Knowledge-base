@@ -18,6 +18,12 @@ THIRD_PARTY_LOGGERS = (
 QUIET_LOGGERS = ("httpx", "httpcore", "httpx2", "httpcore2", "openai", "urllib3")
 
 
+_STANDARD_RECORD_FIELDS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
+    "message",
+    "asctime",
+}
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -26,9 +32,13 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        # Fields passed as `extra={...}` (e.g. a document_id) were silently dropped before.
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD_RECORD_FIELDS and key not in payload:
+                payload[key] = value
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def configure_logging() -> None:

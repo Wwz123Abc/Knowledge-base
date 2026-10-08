@@ -7,7 +7,7 @@ services:
     environment:
       POSTGRES_DB: rag
       POSTGRES_USER: rag
-      POSTGRES_PASSWORD: rag_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -16,7 +16,8 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "5432:5432"
+      # Loopback by default; set POSTGRES_BIND=0.0.0.0 only if something off-host really needs it.
+      - "${POSTGRES_BIND:-127.0.0.1}:5432:5432"
 
   redis:
     image: redis:7-alpine
@@ -88,9 +89,11 @@ services:
       redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg://rag:rag_password@postgres:5432/rag
+      APP_ENV: ${APP_ENV:-development}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag
       VECTOR_BACKEND: pgvector
-      POSTGRES_VECTOR_URL: postgresql+psycopg://rag:rag_password@postgres:5432/rag
+      POSTGRES_VECTOR_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
@@ -151,7 +154,9 @@ services:
       - uploads_data:/app/data/uploads
       - model_cache:/app/data/model_cache
     ports:
-      - "8000:8000"
+      # The reverse proxy on the same host reaches the API over loopback. Use API_BIND=0.0.0.0
+      # to reach it from other machines (e.g. an internal test server) without a proxy.
+      - "${API_BIND:-127.0.0.1}:8000:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 10s
@@ -166,9 +171,9 @@ services:
       api:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg://rag:rag_password@postgres:5432/rag
+      DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag
       VECTOR_BACKEND: pgvector
-      POSTGRES_VECTOR_URL: postgresql+psycopg://rag:rag_password@postgres:5432/rag
+      POSTGRES_VECTOR_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/rag
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}

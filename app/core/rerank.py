@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Protocol
 
 import httpx
@@ -9,6 +10,12 @@ from langchain_core.documents import Document
 from app.config import Settings
 
 logger = logging.getLogger("rag.reranker")
+
+# build_reranker() makes a fresh instance per retrieval, so the failure memory has to live at
+# module level. While the cross-encoder service is down or hanging, skip it for a while
+# instead of making every question (and each corrective retry) wait out the timeout again.
+_COOLDOWN_SECONDS = 30.0
+_unavailable_until = 0.0
 
 
 class Reranker(Protocol):
@@ -48,9 +55,13 @@ class CrossEncoderApiReranker:
         if not self.settings.reranker_base_url:
             logger.warning("Cross-encoder endpoint is not configured; using token-overlap fallback")
             return self.fallback.rerank(query, documents)
+        global _unavailable_until
+        if time.monotonic() < _unavailable_until:
+            return self.fallback.rerank(query, documents)
         try:
             scores = self._request_scores(query, documents)
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            _unavailable_until = time.monotonic() + _COOLDOWN_SECONDS
             logger.warning("Cross-encoder rerank failed; using token-overlap fallback: %s", exc)
             return self.fallback.rerank(query, documents)
         for index, document in enumerate(documents):

@@ -5,6 +5,13 @@ const chatState = { history: [] };
 // devtools open — shows in the login overlay's debug box so a screenshot is enough to
 // diagnose a remote report instead of "it doesn't work" with no further information.
 window.addEventListener("error", (event) => {
+  // Someone who is already signed in must not have the login card thrown over the app by an
+  // unrelated script error; for them it only goes to the console.
+  const logout = document.getElementById("logoutButton");
+  if (logout && !logout.hidden) {
+    console.error(event.message);
+    return;
+  }
   const overlay = document.getElementById("loginOverlay");
   const debugNode = document.getElementById("loginDebugInfo");
   if (!overlay || !debugNode) return;
@@ -82,12 +89,19 @@ function toast(message) {
   setTimeout(() => node.classList.remove("show"), 2600);
 }
 
+// FastAPI reports validation failures as an array of {msg, ...}; showing that array as-is
+// produced "[object Object]".
+function describeErrorDetail(detail, fallback) {
+  if (Array.isArray(detail)) return detail.map((item) => item.msg || String(item)).join("；") || fallback;
+  return detail || fallback;
+}
+
 async function jsonRequest(url, options = {}) {
   const headers = { ...authHeaders(), ...(options.headers || {}) };
   const response = await fetch(url, { ...options, headers });
   if (!response.ok) {
     let message = "请求失败";
-    try { message = (await response.json()).detail || message; } catch (_) {}
+    try { message = describeErrorDetail((await response.json()).detail, message); } catch (_) {}
     const error = new Error(message);
     error.status = response.status;
     throw error;
@@ -318,6 +332,10 @@ async function ask(question) {
     } else if (payload.event === "done") {
       fallback = Boolean(payload.fallback);
       if (payload.cancelled) bubble.innerHTML = renderMarkdown(fullAnswer || "已停止生成。");
+    } else if (payload.event === "reset") {
+      // The model's refusal was already streamed; a fallback answer follows, so drop it.
+      fullAnswer = "";
+      bubble.textContent = "";
     } else if (payload.event === "error") {
       throw new Error(payload.detail || "流式回答出错");
     }
@@ -333,7 +351,7 @@ async function ask(question) {
     });
     if (!response.ok) {
       let message = "请求失败";
-      try { message = (await response.json()).detail || message; } catch (_) {}
+      try { message = describeErrorDetail((await response.json()).detail, message); } catch (_) {}
       throw new Error(message);
     }
     if (!response.body) throw new Error("无响应流");
@@ -754,9 +772,22 @@ function renderKbList() {
   });
 }
 
+// The API returns at most 500 documents per call (default 100); asking once silently
+// truncated the management page to the newest 100 documents.
+async function fetchAllDocuments() {
+  const pageSize = 500;
+  const documents = [];
+  for (let offset = 0; offset < 20 * pageSize; offset += pageSize) {
+    const page = await jsonRequest(`${apiBaseUrl}/documents?offset=${offset}&limit=${pageSize}`);
+    documents.push(...page);
+    if (page.length < pageSize) break;
+  }
+  return documents;
+}
+
 async function loadDocuments() {
   try {
-    cachedDocuments = await jsonRequest(`${apiBaseUrl}/documents`);
+    cachedDocuments = await fetchAllDocuments();
     $("#documentCount").textContent = `${cachedDocuments.length} 份文档`;
     renderKbList();
     renderDocumentList();
@@ -785,8 +816,11 @@ async function pollJob(jobId) {
 
 async function pollJobsBatch(jobIds) {
   const pending = new Set(jobIds);
+  const errorCounts = new Map();
   let completed = 0;
   let failed = 0;
+  let cancelled = 0;
+  let unknown = 0;
   for (let attempt = 0; attempt < 60 && pending.size; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     await Promise.all(
@@ -797,9 +831,18 @@ async function pollJobsBatch(jobIds) {
             pending.delete(jobId);
             if (job.status === "completed") completed += 1;
             if (job.status === "failed") failed += 1;
+            if (job.status === "cancelled") cancelled += 1;
           }
+          errorCounts.delete(jobId);
         } catch (_) {
-          pending.delete(jobId);
+          // A rate-limit (429) or a network blip says nothing about the job; only give up on
+          // it after repeated failures, and say so instead of reporting it as a success.
+          const count = (errorCounts.get(jobId) || 0) + 1;
+          errorCounts.set(jobId, count);
+          if (count >= 5) {
+            pending.delete(jobId);
+            unknown += 1;
+          }
         }
       })
     );
@@ -812,7 +855,15 @@ async function pollJobsBatch(jobIds) {
     toast(`批量索引仍有 ${pending.size} 个文件在后台处理，可稍后刷新资料列表`);
     return;
   }
-  toast(failed ? `批量索引完成：${completed} 个成功，${failed} 个失败` : `批量索引完成：${jobIds.length} 个文件全部成功`);
+  if (!failed && !cancelled && !unknown) {
+    toast(`批量索引完成：${jobIds.length} 个文件全部成功`);
+    return;
+  }
+  const parts = [`${completed} 个成功`];
+  if (failed) parts.push(`${failed} 个失败`);
+  if (cancelled) parts.push(`${cancelled} 个已取消`);
+  if (unknown) parts.push(`${unknown} 个状态未知，请刷新列表确认`);
+  toast(`批量索引完成：${parts.join("，")}`);
 }
 
 const chatKnowledgeSelection = new Set();

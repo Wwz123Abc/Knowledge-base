@@ -1,3 +1,7 @@
 {$DOMAIN} {
+	# 体积限制放在反代这一层，超限请求不会进入应用进程（应用内另有同样的兜底）
+	request_body {
+		max_size 40MB
+	}
 	reverse_proxy api:8000
 }

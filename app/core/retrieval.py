@@ -14,6 +14,8 @@ from app.domain.retrieval.statute import is_effective_document
 from app.domain.retrieval.tokens import tokenize
 from app.models import KnowledgeChunk, KnowledgeDocument
 
+_MAX_INJECTED_CHUNKS = 3
+
 
 @dataclass(slots=True)
 class RetrievalResult:
@@ -67,7 +69,9 @@ class HybridRetriever(LexicalSearchMixin):
             settings=self.settings,
         )
         blend = _blend_candidates(fused, vector_docs, lexical_docs, self.settings.rerank_k)
-        injected = self._statute_injected_documents(db, query, tenant_id, user_groups, fused)
+        injected = self._statute_injected_documents(
+            db, query, tenant_id, user_groups, fused, knowledge_base_ids or []
+        )
         blend_ids = {str(doc.metadata["chunk_id"]) for doc in blend}
         blend.extend(doc for doc in injected if str(doc.metadata["chunk_id"]) not in blend_ids)
         reranked = reranker.rerank(query, blend)
@@ -119,6 +123,7 @@ class HybridRetriever(LexicalSearchMixin):
         tenant_id: str,
         user_groups: list[str],
         candidate_documents: list[Document],
+        knowledge_base_ids: list[str],
     ) -> list[Document]:
         """Return exact 第N条 matches (and the max-article chunk for count queries).
 
@@ -130,8 +135,14 @@ class HybridRetriever(LexicalSearchMixin):
         from app.domain.retrieval import statute
 
         chunks = statute.find_article_chunks(
-            db, tenant_id, statute.article_phrases(query), user_groups
+            db, tenant_id, statute.article_phrases(query), user_groups, knowledge_base_ids
         )
+        # An article number alone ("第3条") is in many documents. Keep the few from documents
+        # the semantic/lexical search already surfaced ahead of arbitrary ones, and never let
+        # exact matches fill the whole context window.
+        candidate_ids = {str(doc.metadata.get("document_id")) for doc in candidate_documents}
+        chunks.sort(key=lambda chunk: chunk.document_id not in candidate_ids)
+        chunks = chunks[:_MAX_INJECTED_CHUNKS]
         if not chunks and statute.is_count_query(query):
             document_ids = {str(doc.metadata.get("document_id")) for doc in candidate_documents}
             max_chunk = statute.find_max_article_chunk(db, tenant_id, list(document_ids))

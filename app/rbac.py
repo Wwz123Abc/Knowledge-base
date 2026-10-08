@@ -4,6 +4,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException
 from sqlalchemy import delete, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.dependencies import DbSession
@@ -61,9 +62,7 @@ def ensure_default_roles(db: Session) -> None:
     db.flush()
 
     for name, (description, codes) in SYSTEM_ROLES.items():
-        role = db.scalar(
-            select(Role).where(Role.tenant_id.is_(None), Role.name == name)
-        )
+        role = db.scalar(select(Role).where(Role.tenant_id.is_(None), Role.name == name))
         if role is None:
             role = Role(tenant_id=None, name=name, description=description, is_system=True)
             db.add(role)
@@ -118,6 +117,12 @@ def permission_codes_for(db: Session, tenant_id: str, roles: tuple[str, ...]) ->
     return set(rows)
 
 
+def can_manage_documents(db: Session, auth: AuthContext) -> bool:
+    return SUPER_ADMIN_ROLE in auth.roles or "document.manage" in permission_codes_for(
+        db, auth.tenant_id, auth.roles
+    )
+
+
 def require_permission(code: str):
     def _dependency(db: DbSession, auth: CurrentUser) -> AuthContext:
         if SUPER_ADMIN_ROLE in auth.roles:
@@ -151,9 +156,7 @@ class RoleService:
             )
         )
 
-    def create_role(
-        self, db: Session, tenant_id: str, name: str, description: str | None
-    ) -> Role:
+    def create_role(self, db: Session, tenant_id: str, name: str, description: str | None) -> Role:
         name = name.strip()
         if not name:
             raise ValueError("角色名称不能为空")
@@ -163,7 +166,7 @@ class RoleService:
         db.add(role)
         try:
             db.commit()
-        except Exception as exc:
+        except IntegrityError as exc:
             db.rollback()
             raise ValueError("角色名称已存在") from exc
         db.refresh(role)
@@ -244,7 +247,7 @@ class RoleService:
         db.add(assignment)
         try:
             db.commit()
-        except Exception as exc:
+        except IntegrityError as exc:
             db.rollback()
             raise ValueError("该账号已经拥有这个角色") from exc
         db.refresh(assignment)

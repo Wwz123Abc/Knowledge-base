@@ -19,6 +19,15 @@ def _escape_attribute(value: str) -> str:
     )
 
 
+_CONTEXT_TAG = re.compile(r"<(/?\s*knowledge_document)", re.IGNORECASE)
+
+
+def _neutralize_context_tags(content: str) -> str:
+    # Uploaded text is untrusted: a literal </knowledge_document> in it would close the
+    # wrapper early and let the rest read as instructions outside the quoted material.
+    return _CONTEXT_TAG.sub(r"&lt;\1", content)
+
+
 def format_context(documents: list[Document]) -> str:
     parts = []
     for index, document in enumerate(documents, start=1):
@@ -28,7 +37,7 @@ def format_context(documents: list[Document]) -> str:
         safe_title = _escape_attribute(f"{title}{locator}")
         parts.append(
             f'<knowledge_document index="{index}" title="{safe_title}">\n'
-            f"{document.page_content}\n"
+            f"{_neutralize_context_tags(document.page_content)}\n"
             "</knowledge_document>"
         )
     return "\n\n".join(parts)
@@ -76,7 +85,16 @@ def groundedness(answer: str, documents: list[Document]) -> float:
     return len(answer_tokens & context_tokens) / max(len(answer_tokens), 1)
 
 
+_CITATION_MARK = re.compile(r"\[\d{1,2}\]")
+
+
 def is_insufficient_answer(answer: str) -> bool:
+    # An answer that cites its sources is grounded, even when it adds that part of the
+    # question isn't covered — system-prompt rule 6 tells the model to write exactly that
+    # ("资料未提及"). Treating it as a refusal threw the grounded part away and replaced it
+    # with an ungrounded fallback answer.
+    if _CITATION_MARK.search(answer):
+        return False
     normalized = "".join(answer.split())
     markers = (
         "知识库中没有找到足够依据",
@@ -94,7 +112,7 @@ def validate_citation_indices(answer: str, document_count: int) -> tuple[str, li
     invalid = sorted(
         {
             int(match.group(1))
-            for match in re.finditer(r"\[(\d+)\]", answer)
+            for match in re.finditer(r"\[(\d{1,2})\]", answer)
             if not 1 <= int(match.group(1)) <= document_count
         }
     )
@@ -102,7 +120,7 @@ def validate_citation_indices(answer: str, document_count: int) -> tuple[str, li
         return answer, []
     invalid_set = set(invalid)
     cleaned = re.sub(
-        r"\[(\d+)\]",
+        r"\[(\d{1,2})\]",
         lambda match: "" if int(match.group(1)) in invalid_set else match.group(0),
         answer,
     )

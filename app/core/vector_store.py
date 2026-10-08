@@ -24,6 +24,7 @@ class EnterpriseVectorStore:
     def __init__(self, settings: Settings, embeddings: Embeddings):
         self.settings = settings
         self.embeddings = embeddings
+        self._iterative_scan = False
         # One engine (and connection pool) reused for every raw-SQL call this class
         # makes, instead of each method opening its own via create_engine() — that
         # used to rebuild the pool from scratch on every _ensure_vector_index /
@@ -42,6 +43,7 @@ class EnterpriseVectorStore:
                 use_jsonb=True,
             )
             self._ensure_vector_index()
+            self._iterative_scan = self._supports_iterative_scan()
         else:
             self.store = InMemoryVectorStore(embedding=embeddings)
 
@@ -56,12 +58,23 @@ class EnterpriseVectorStore:
         engine = self._raw_engine
         try:
             with engine.begin() as connection:
-                connection.execute(
+                # ALTER ... TYPE takes an exclusive table lock even when the type is already
+                # right, and the API and worker both run this on every start — only do it
+                # when the column actually still needs fixing.
+                current = connection.execute(
                     text(
-                        "ALTER TABLE langchain_pg_embedding ALTER COLUMN embedding "
-                        f"TYPE vector({self.settings.embedding_dimensions})"
+                        "SELECT format_type(attribute.atttypid, attribute.atttypmod) "
+                        "FROM pg_attribute AS attribute "
+                        "WHERE attribute.attrelid = to_regclass('langchain_pg_embedding') "
+                        "AND attribute.attname = 'embedding'"
                     )
-                )
+                ).scalar()
+                wanted = f"vector({self.settings.embedding_dimensions})"
+                if current != wanted:
+                    alter = (
+                        f"ALTER TABLE langchain_pg_embedding ALTER COLUMN embedding TYPE {wanted}"
+                    )
+                    connection.execute(text(alter))
                 connection.execute(
                     text(
                         "CREATE INDEX IF NOT EXISTS ix_langchain_pg_embedding_hnsw "
@@ -70,6 +83,25 @@ class EnterpriseVectorStore:
                 )
         except Exception:
             logger.warning("Could not create pgvector HNSW index", exc_info=True)
+
+    def _supports_iterative_scan(self) -> bool:
+        # pgvector >= 0.8. Without it an HNSW query reads a fixed number of nearest candidates
+        # and only *then* applies the tenant/ACL/knowledge-base filter, so a user who can see
+        # little of the corpus gets few or no vector hits even when matching rows exist.
+        # Decided from the installed extension version: `SHOW hnsw.iterative_scan` errors in a
+        # fresh session until pgvector's library has been loaded, which would read as "no".
+        try:
+            with self._raw_engine.connect() as connection:
+                version = connection.execute(
+                    text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+                ).scalar()
+            major, minor = (int(part) for part in str(version).split(".")[:2])
+            if (major, minor) >= (0, 8):
+                return True
+        except Exception:
+            logger.warning("Could not determine the pgvector version", exc_info=True)
+        logger.info("pgvector iterative scan is not available; filtered recall may suffer")
+        return False
 
     def add_documents(self, documents: list[Document], ids: list[str]) -> list[str]:
         return self.store.add_documents(documents, ids=ids)
@@ -207,6 +239,9 @@ class EnterpriseVectorStore:
             bindparam("knowledge_bases", type_=ARRAY(String)),
         )
         with engine.connect() as connection:
+            if self._iterative_scan:
+                connection.execute(text("SET LOCAL hnsw.iterative_scan = relaxed_order"), {})
+                connection.execute(text("SET LOCAL hnsw.ef_search = 100"), {})
             rows = connection.execute(
                 statement,
                 {

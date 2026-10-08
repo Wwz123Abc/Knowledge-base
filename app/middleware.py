@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import time
 from collections import defaultdict, deque
@@ -39,13 +40,26 @@ class PlatformMiddleware(BaseHTTPMiddleware):
 
     def _client_key(self, request: Request) -> str:
         direct = request.client.host if request.client else "unknown"
-        if direct not in self.settings.trusted_proxy_ip_list:
+        trusted = set(self.settings.trusted_proxy_ip_list)
+        if direct not in trusted:
             return direct
-        forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-        try:
-            return str(ipaddress.ip_address(forwarded)) if forwarded else direct
-        except ValueError:
-            return direct
+        # Walk X-Forwarded-For from the right, skipping our own proxies: the right-hand entries
+        # are the ones our proxies appended, while the leftmost is whatever the client chose to
+        # send (nginx's $proxy_add_x_forwarded_for appends to it, it doesn't replace it), so
+        # trusting it let anyone pick their own rate-limit bucket.
+        entries = [
+            item.strip()
+            for item in request.headers.get("X-Forwarded-For", "").split(",")
+            if item.strip()
+        ]
+        for entry in reversed(entries):
+            try:
+                address = str(ipaddress.ip_address(entry))
+            except ValueError:
+                return direct
+            if address not in trusted:
+                return address
+        return direct
 
     def _rate_limited(self, key: str, now: float) -> bool:
         if self.redis:
@@ -62,6 +76,11 @@ class PlatformMiddleware(BaseHTTPMiddleware):
                 return count > self.settings.rate_limit_per_minute
             except redis.RedisError:
                 logger.warning("Redis rate limiter unavailable; using process-local fallback")
+        if len(self.requests) > 10_000:
+            # Only used while Redis is down, but keys were never removed: a stream of
+            # distinct client IPs grew this dict without bound.
+            for stale in [k for k, w in self.requests.items() if not w or w[-1] <= now - 60]:
+                del self.requests[stale]
         window = self.requests[key]
         while window and window[0] <= now - 60:
             window.popleft()
@@ -113,7 +132,9 @@ class PlatformMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             duration = time.perf_counter() - started
             route = request.scope.get("route")
-            path = getattr(route, "path", request.url.path)
+            # Unmatched requests (404s, scanners) must not mint a new Prometheus series per
+            # distinct URL, so they all share one label.
+            path = getattr(route, "path", "unmatched")
             HTTP_REQUESTS.labels(request.method, path, str(response.status_code)).inc()
             HTTP_REQUEST_DURATION.labels(request.method, path).observe(duration)
             logger.info(
@@ -127,3 +148,85 @@ class PlatformMiddleware(BaseHTTPMiddleware):
             return self._add_security_headers(response, request_id)
         finally:
             request_id_context.reset(context_token)
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+class BodySizeLimitMiddleware:
+    """Reject oversized request bodies before the framework buffers them.
+
+    FastAPI parses a multipart body *before* it runs the auth dependency, so without this an
+    unauthenticated client could stream gigabytes into the server's temp storage and only
+    then get a 401. The limit is checked against Content-Length up front and, for chunked
+    bodies that don't declare one, against the bytes actually received.
+    """
+
+    _METHODS = {"POST", "PUT", "PATCH"}
+
+    def __init__(self, app, multipart_limit: int, default_limit: int):
+        self.app = app
+        self.multipart_limit = multipart_limit
+        self.default_limit = default_limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] not in self._METHODS:
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope["headers"])
+        is_multipart = headers.get(b"content-type", b"").lower().startswith(b"multipart/form-data")
+        limit = self.multipart_limit if is_multipart else self.default_limit
+        declared = headers.get(b"content-length", b"")
+        if declared.isdigit() and int(declared) > limit:
+            await self._reject(send)
+            return
+
+        received = 0
+        exceeded = False
+        answered = False
+
+        async def limited_receive():
+            nonlocal received, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    exceeded = True
+                    raise _BodyTooLarge
+            return message
+
+        async def guarded_send(message):
+            # Once the limit tripped, whatever the framework makes of the aborted read (FastAPI
+            # wraps it, inside an ExceptionGroup, into a generic 400) is replaced by one 413.
+            nonlocal answered
+            if not exceeded:
+                await send(message)
+            elif not answered:
+                answered = True
+                await self._reject(send)
+
+        try:
+            await self.app(scope, limited_receive, guarded_send)
+        except _BodyTooLarge:
+            pass
+        except Exception:
+            if not exceeded:
+                raise
+        if exceeded and not answered:
+            await self._reject(send)
+
+    @staticmethod
+    async def _reject(send) -> None:
+        body = json.dumps({"detail": "请求体过大"}, ensure_ascii=False).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})

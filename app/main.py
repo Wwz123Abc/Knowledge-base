@@ -1,8 +1,10 @@
+import hashlib
+import hmac
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.middleware.cors import CORSMiddleware
@@ -12,7 +14,7 @@ from app.api.routes import router
 from app.config import get_settings
 from app.db import SessionLocal, init_db
 from app.logging_setup import configure_logging
-from app.middleware import PlatformMiddleware
+from app.middleware import BodySizeLimitMiddleware, PlatformMiddleware
 
 
 @asynccontextmanager
@@ -30,8 +32,30 @@ async def lifespan(_: FastAPI):
 
 settings = get_settings()
 configure_logging()
-app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+
+
+def _api_docs_options(current) -> dict:
+    # The interactive docs and openapi.json list every route and schema; there is no reason
+    # to publish that on an internet-facing production host.
+    if current.app_env.strip().lower() == "production":
+        return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    return {}
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version="0.1.0",
+    lifespan=lifespan,
+    **_api_docs_options(settings),
+)
 app.add_middleware(PlatformMiddleware, settings=settings)
+# Outermost: oversized bodies are refused before anything else touches them. Uploads get the
+# configured file limit plus a little multipart overhead; every other body is small JSON.
+app.add_middleware(
+    BodySizeLimitMiddleware,
+    multipart_limit=(settings.max_upload_mb + 1) * 1024 * 1024,
+    default_limit=1024 * 1024,
+)
 if settings.allowed_origin_list:
     app.add_middleware(
         CORSMiddleware,
@@ -60,11 +84,29 @@ async def no_heuristic_cache(request, call_next):
     return response
 
 
+def _asset_version() -> str:
+    # Derived from the real files so a changed app.js/styles.css always gets a new URL — the
+    # versioned copies (app-v33.js ...) this replaces had to be bumped by hand, and one deploy
+    # shipped a fix to app.js while index.html still pointed at the stale copy.
+    digest = hashlib.sha1()
+    for name in ("app.js", "styles.css"):
+        stat = (static_dir / name).stat()
+        digest.update(f"{name}:{stat.st_mtime_ns}:{stat.st_size}".encode())
+    return digest.hexdigest()[:10]
+
+
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(static_dir / "index.html")
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(html.replace("__ASSET_VERSION__", _asset_version()))
 
 
 @app.get("/api/metrics", include_in_schema=False)
-def metrics():
+def metrics(request: Request):
+    if settings.metrics_token:
+        supplied = request.headers.get("Authorization", "")
+        if not hmac.compare_digest(supplied, f"Bearer {settings.metrics_token}"):
+            raise HTTPException(status_code=401, detail="需要有效的指标访问令牌")
+    elif settings.app_env.strip().lower() == "production":
+        raise HTTPException(status_code=404, detail="Not Found")
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

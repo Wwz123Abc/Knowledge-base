@@ -183,7 +183,10 @@ class DocumentUploadMixin:
         document.stored_path = str(stored_path)
         document.content_type = upload.content_type or document.content_type
         document.content_hash = digest
-        document.status = "queued"
+        if not document.chunk_count:
+            # With nothing indexed yet the document is simply waiting; one that already
+            # has chunks keeps serving them until the new version has finished indexing.
+            document.status = "queued"
         job = IngestionJob(
             tenant_id=tenant_id,
             document_id=document.id,
