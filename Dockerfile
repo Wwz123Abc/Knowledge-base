@@ -41,6 +41,7 @@ COPY app ./app
 RUN pip install --disable-pip-version-check --no-deps .
 COPY alembic.ini ./
 COPY migrations ./migrations
+COPY scripts ./scripts
 COPY data ./data
 RUN groupadd --system rag && useradd --system --gid rag --home-dir /app rag \
     && mkdir -p /app/data/uploads /app/data/model_cache \
