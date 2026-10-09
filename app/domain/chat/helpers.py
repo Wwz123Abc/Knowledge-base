@@ -120,9 +120,38 @@ def groundedness(answer: str, documents: list[Document]) -> float:
 _CITATION_MARK = re.compile(r"\[\d{1,2}\]")
 
 
+_REFUSAL_OPENERS = (
+    "没有找到",
+    "未找到",
+    "没有查到",
+    "未查到",
+    "没有相关",
+    "没有足够依据",
+    "未提及",
+    "没有提及",
+    "未提供",
+    "没有提供",
+    "没有明确",
+    "无法回答",
+    "无法确定",
+    "无法给出",
+)
+_FIRST_SENTENCE = re.compile(r"[。！？；\n]")
+
+
 def is_insufficient_answer(answer: str) -> bool:
-    # An answer that cites its sources is grounded, even when it adds that part of the
-    # question isn't covered — system-prompt rule 6 tells the model to write exactly that
+    # An answer that opens with a refusal ("知识库中没有找到…") is one, even if a later sentence
+    # cites some loosely related passage — that is exactly when the user wants the AI fallback
+    # answer instead of a dead end.
+    first_sentence = _FIRST_SENTENCE.split(answer.strip(), maxsplit=1)[0]
+    mark = _CITATION_MARK.search(first_sentence)
+    # Only what comes *before* the first citation counts: "年假为5天[1]，试用期资料中未提及"
+    # states a supported fact first, "资料中未提及…，仅提到相关流程[2]" starts by giving up.
+    opener = "".join((first_sentence[: mark.start()] if mark else first_sentence).split())
+    if any(phrase in opener for phrase in _REFUSAL_OPENERS):
+        return True
+    # An answer that cites its sources is otherwise grounded, even when it adds that part of
+    # the question isn't covered — system-prompt rule 6 tells the model to write exactly that
     # ("资料未提及"). Treating it as a refusal threw the grounded part away and replaced it
     # with an ungrounded fallback answer.
     if _CITATION_MARK.search(answer):

@@ -103,6 +103,22 @@ def test_cited_partial_answers_are_not_treated_as_refusals():
     assert is_insufficient_answer("该问题无法回答。")
 
 
+def test_a_refusal_that_cites_something_still_triggers_the_ai_fallback():
+    # The real production answer: it opens by saying nothing was found, then cites a
+    # loosely related passage. The user's setting says "answer with AI when nothing is found".
+    refusal = (
+        "知识库中没有找到“员工每年固定有多少天年假”的明确天数规定。\n\n"
+        "资料中只提到年假天数根据公司工龄核算，并给出了计算公式 [1]。因此无法据此回答。"
+    )
+    assert is_insufficient_answer(refusal)
+    assert is_insufficient_answer("资料中未提及该问题的具体标准，仅提到相关流程[2]。")
+
+    # grounded answers that merely mention something is not covered stay as they are
+    assert not is_insufficient_answer("年假为5天[1]，试用期的具体规定资料中未提及。")
+    assert not is_insufficient_answer("春节放假4天[1]。资料未提及调休安排。")
+    assert not is_insufficient_answer("员工应在十个工作日内提交报销 [1]。")
+
+
 def test_citation_cleanup_leaves_years_and_other_numbers_alone():
     answer, invalid = validate_citation_indices("依据[2024]号文件，年假5天[1]，另见[9]。", 3)
     assert answer == "依据[2024]号文件，年假5天[1]，另见。"
