@@ -264,6 +264,33 @@ function addMessage(role, content, citations = [], fallback = false) {
   wrapper.scrollIntoView({ behavior: "smooth", block: "end" });
 }
 
+// The server sends every retrieved passage up front, but most of them never make it into the
+// answer. Show only the ones the answer actually cites ([n]), one line per document with the
+// quoted passages folded away, and nothing at all for refusals and general-knowledge fallbacks.
+function renderCitations(citations, answer, hide) {
+  if (hide || !citations.length) return "";
+  const cited = new Set(Array.from(answer.matchAll(/\[(\d{1,2})\]/g), (match) => Number(match[1])));
+  const numbered = citations.map((item, index) => ({ item, number: index + 1 }));
+  let picked = numbered.filter(({ number }) => cited.has(number));
+  if (!picked.length) picked = numbered.slice(0, 2);
+  const byDocument = new Map();
+  for (const entry of picked) {
+    const key = entry.item.document_id || entry.item.title;
+    if (!byDocument.has(key)) byDocument.set(key, []);
+    byDocument.get(key).push(entry);
+  }
+  const rows = Array.from(byDocument.values()).map((entries) => {
+    const marks = entries.map(({ number }) => `[${number}]`).join("");
+    const pages = Array.from(new Set(entries.map(({ item }) => item.page_number).filter(Boolean)));
+    const pageLabel = pages.length ? ` · 第 ${pages.join("、")} 页` : "";
+    const excerpts = entries
+      .map(({ number, item }) => `<p>[${number}] ${escapeHtml(item.excerpt)}</p>`)
+      .join("");
+    return `<details class="citation"><summary>${marks} ${escapeHtml(entries[0].item.title)}${pageLabel}</summary>${excerpts}</details>`;
+  });
+  return `<div class="citations"><div class="citations-label">引用来源</div>${rows.join("")}</div>`;
+}
+
 async function ask(question) {
   const welcome = $(".welcome-card");
   if (welcome) welcome.remove();
@@ -282,6 +309,7 @@ async function ask(question) {
   let traceId = null;
   let citations = [];
   let fallback = false;
+  let insufficient = false;
   let fullAnswer = "";
   let started = false;
   // Re-parsing and re-rendering the whole answer on every single streamed token is
@@ -331,6 +359,7 @@ async function ask(question) {
       scheduleRender();
     } else if (payload.event === "done") {
       fallback = Boolean(payload.fallback);
+      insufficient = Boolean(payload.insufficient_context);
       if (payload.cancelled) bubble.innerHTML = renderMarkdown(fullAnswer || "已停止生成。");
     } else if (payload.event === "reset") {
       // The model's refusal was already streamed; a fallback answer follows, so drop it.
@@ -396,12 +425,8 @@ async function ask(question) {
     notice.textContent = "⚠️ 非企业官方文档内容（AI 通用回答，仅供参考）";
     wrapper.insertBefore(notice, bubble);
   }
-  if (citations.length) {
-    const citationHtml = `<div class="citations">${citations.map((item, index) =>
-      `<div class="citation"><strong>[${index + 1}] ${escapeHtml(item.title)}</strong>${item.page_number ? ` · 第 ${item.page_number} 页` : ""}<br>${escapeHtml(item.excerpt)}</div>`
-    ).join("")}</div>`;
-    bubble.insertAdjacentHTML("beforeend", citationHtml);
-  }
+  const citationHtml = renderCitations(citations, fullAnswer, insufficient || fallback);
+  if (citationHtml) bubble.insertAdjacentHTML("beforeend", citationHtml);
   if (fullAnswer) {
     chatState.history.push({ role: "assistant", content: fullAnswer });
   }

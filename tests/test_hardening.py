@@ -35,6 +35,8 @@ def test_index_points_at_the_real_assets_with_a_derived_version():
         # The streamed-answer render throttle shipped in app.js but not in the stale
         # versioned copy index.html used to load; keep the page pointed at the real file.
         assert "scheduleRender" in script.text
+        # answers show only the sources they cite, folded, not every retrieved passage
+        assert "renderCitations" in script.text
 
 
 async def _echo_length(request):
