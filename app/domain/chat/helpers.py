@@ -53,29 +53,61 @@ def format_history(history: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-_EXCERPT_BOUNDARY_MARKS = "。！？；\n"
+_EXCERPT_BOUNDARY = re.compile(r"[。！？；\n]")
+# Chunks are cut at sentence marks and keep the mark at the start of the next chunk, so the
+# stored text often opens with a stray "。" or "；" that makes an excerpt look broken.
+_EXCERPT_LEADING_JUNK = "。！？；，、：:）) \t\r\n"
 
 
-def _excerpt(content: str, limit: int = 220) -> str:
-    if len(content) <= limit:
-        return content
-    window = content[:limit]
-    # Prefer cutting at the last sentence-ending punctuation near the limit so
-    # excerpts don't end mid-word; only fall back to a hard cut (with an
-    # ellipsis to signal it's truncated) when no boundary is close enough.
-    boundary = max((window.rfind(mark) for mark in _EXCERPT_BOUNDARY_MARKS), default=-1)
+def _query_terms(query: str) -> set[str]:
+    terms = {word.lower() for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]+", query)}
+    for run in re.findall(r"[一-鿿]+", query):
+        terms.update(run[index : index + 2] for index in range(len(run) - 1))
+    return terms
+
+
+def _excerpt(content: str, limit: int = 220, query: str = "") -> str:
+    """The part of a retrieved chunk to show as evidence.
+
+    The head of the chunk is rarely the relevant part: a 700-character chunk about leave rules
+    answered "how many days off for Spring Festival" with its first 220 characters — which
+    ended just before the sentence that says so. Pick the stretch (starting at a sentence
+    boundary) that contains the most terms from the question instead.
+    """
+    text = content.strip().lstrip(_EXCERPT_LEADING_JUNK)
+    if len(text) <= limit:
+        return text
+    starts = [0] + [m.end() for m in _EXCERPT_BOUNDARY.finditer(text) if m.end() < len(text)]
+    terms = _query_terms(query)
+    best = 0
+    if terms:
+
+        def hits(start: int) -> int:
+            window = text[start : start + limit].lower()
+            return sum(1 for term in terms if term in window)
+
+        top = max(hits(start) for start in starts)
+        if top:
+            # Among the windows that contain the most terms, take the latest start, so the
+            # matching sentence sits near the top of the excerpt rather than at its far edge.
+            best = max(start for start in starts if hits(start) == top)
+    window = text[best : best + limit]
+    prefix = "…" if best else ""
+    if best + limit >= len(text):
+        return prefix + window.lstrip(_EXCERPT_LEADING_JUNK)
+    boundary = max((window.rfind(mark) for mark in "。！？；\n"), default=-1)
     if boundary >= limit - 60:
-        return window[: boundary + 1]
-    return window.rstrip() + "…"
+        return prefix + window[: boundary + 1].lstrip(_EXCERPT_LEADING_JUNK)
+    return prefix + window.rstrip() + "…"
 
 
-def citation(document: Document) -> Citation:
+def citation(document: Document, query: str = "") -> Citation:
     return Citation(
         document_id=str(document.metadata.get("document_id", "")),
         title=str(document.metadata.get("title", "未命名文档")),
         chunk_id=str(document.metadata.get("chunk_id", "")),
         page_number=document.metadata.get("page_number"),
-        excerpt=_excerpt(document.page_content),
+        excerpt=_excerpt(document.page_content, query=query),
     )
 
 

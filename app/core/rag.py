@@ -116,7 +116,9 @@ class RagService:
         return AskResponse(
             trace_id=trace.id,
             answer=answer,
-            citations=[] if insufficient_context else [_citation(doc) for doc in documents],
+            citations=[]
+            if insufficient_context
+            else [_citation(doc, rewritten_query) for doc in documents],
             insufficient_context=insufficient_context,
         )
 
@@ -147,7 +149,7 @@ class RagService:
         retrieval = self._retrieve(db, rewritten_query, auth, request)
         documents = retrieval.documents
         trace = self._create_trace(db, request, auth, rewritten_query, retrieval.scores, documents)
-        citations = [_citation(doc).model_dump() for doc in documents]
+        citations = [_citation(doc, rewritten_query).model_dump() for doc in documents]
         # Read the id *before* committing: after the commit the instance is expired, and
         # touching any attribute (even the id) issues a SELECT that reopens a transaction —
         # which would keep one pooled connection checked out for the whole LLM stream and cap
